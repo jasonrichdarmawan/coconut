@@ -4,8 +4,14 @@
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
+from torch import Tensor
+
 from collections import namedtuple
+
 from transformers.models.gpt2 import GPT2LMHeadModel
+from transformers import PreTrainedModel
+
+from jaxtyping import Float
 
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 MAX_N_LATENT = 8
@@ -15,11 +21,11 @@ class Coconut(nn.Module):
 
     def __init__(
         self,
-        base_causallm,
-        latent_token_id,
-        start_latent_id,
-        end_latent_id,
-        eos_token_id,
+        base_causallm: PreTrainedModel,
+        latent_token_id: int,
+        start_latent_id: int,
+        end_latent_id: int,
+        eos_token_id: int,
     ):
 
         super(Coconut, self).__init__()
@@ -36,9 +42,13 @@ class Coconut(nn.Module):
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
 
-    def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
+    def forward(self, 
+                input_ids: Float[Tensor, "batch sequence"], 
+                attention_mask: Float[Tensor, "batch sequence"], 
+                labels: Float[Tensor, "batch sequence"], 
+                position_ids: Float[Tensor, "batch sequence"], **kwargs):
 
-        logits = []
+        logits: list[Float[Tensor, "batch sequence vocab_size"]] = []
 
         latent_indices = (
             input_ids == self.latent_token_id
@@ -52,11 +62,12 @@ class Coconut(nn.Module):
         max_n_latents = max([len(l) for l in latent_lists])
 
         next_compute_range = (0, input_ids.shape[1])
-        inputs_embeds = self.embedding(input_ids)
+        inputs_embeds: Float[Tensor, "batch seq_len n_embd"] = self.embedding(input_ids)
 
         if max_n_latents > 0:
             next_compute_range = (0, latent_indices[:, 1].min().item())
             # before the earliest latent token position
+            # [Question] [Latent] [Answer]
 
         kv_cache = None
 
@@ -80,6 +91,9 @@ class Coconut(nn.Module):
 
             else:
                 # extract kv cache to reuse
+                # k: (bs, num_heads, seq_len, head_dim)
+                # v: (bs, num_heads, seq_len, head_dim)
+                # kv_cache: (num_layers, (k, v))
                 past_key_values = [
                     (
                         k[:, :, : next_compute_range[0], :],
@@ -100,17 +114,22 @@ class Coconut(nn.Module):
                     output_hidden_states=True,
                 )
 
+                # TODO: this is interesting
                 hidden_states_offset = next_compute_range[0]
                 # when we use kv_cache for the first k tokens
                 # in `outputs.hidden_states`, [0, k) will be skipped
                 # so we need to keep this offset to correctly use the last hidden states
 
+            # TODO: this is interesting
+            # why do we keep append the logits?
             logits.append(outputs.logits)
 
             next_compute_range = (
                 next_compute_range[1],
                 (
                     input_ids.shape[1]
+                    # TODO: pass_idx + 1 > max_n_latents
+                    # will never be True, right?
                     if pass_idx + 1 >= max_n_latents
                     else next_compute_range[1] + 1
                 ),
@@ -144,7 +163,9 @@ class Coconut(nn.Module):
             for idx_pair in filling_indices:
                 batch_idx, token_idx = idx_pair
 
-                # replace it with the preceding last hidden states
+                # TODO: this is interesting
+                # what is max_n_latents?
+                # max_n_latents is max([k *= config.c_thought, ...])
                 tensor_list[batch_idx][token_idx] = hidden_states[
                     batch_idx, token_idx - 1 - hidden_states_offset, :
                 ]
@@ -178,11 +199,13 @@ class Coconut(nn.Module):
             output_hidden_states=True,
         )
 
+        # TODO: this is weird
+        # why do we call logits.append(outputs.logits) twice?
         logits.append(outputs.logits)
 
         self.gen_forward_cnt += max_n_latents + 1
 
-        logits = torch.cat(logits, dim=-2)
+        logits: Float[Tensor, "batch seq_len vocab_size"] = torch.cat(logits, dim=-2) # concat along the sequence dimension
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         loss_fct = CrossEntropyLoss()

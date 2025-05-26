@@ -4,7 +4,9 @@
 import torch
 import torch.distributed
 import torch.optim as optim
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch import Tensor
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+
 
 import wandb
 
@@ -15,6 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+from transformers.models.gpt2.tokenization_gpt2_fast import GPT2TokenizerFast
 
 from coconut import Coconut
 from dataset import (
@@ -35,6 +38,16 @@ import argparse
 import functools
 from utils import Config, set_seed
 
+from jaxtyping import Float
+
+from typing import Optional
+
+class TrainDataLoaderDict:
+    input_ids: Float[Tensor, "batch seq_len"]
+    attention_mask: Float[Tensor, "batch seq_len"]
+    idx: Float[Tensor, "batch"]
+    labels: Optional[Float[Tensor, "batch seq_len"]]
+    position_ids: Optional[Float[Tensor, "batch seq_len"]]
 
 def main():
 
@@ -51,12 +64,12 @@ def main():
 
     # load the configuration file
     with open(args.config_file) as f:
-        config_dict = yaml.safe_load(f)
+        config_dict: Config = yaml.safe_load(f)
 
     if rank == 0:
         print("Config:", config_dict)
 
-    configs = Config(config_dict)
+    configs = config_dict
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -100,19 +113,20 @@ def main():
             f"Loading from {configs.load_model_path} and skip the first {configs.resume} epochs"
         )
 
-    model = AutoModelForCausalLM.from_pretrained(configs.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(configs.model_id)
+    tokenizer: GPT2TokenizerFast = AutoTokenizer.from_pretrained(configs.model_id)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_tokens("<|start-latent|>")
     tokenizer.add_tokens("<|end-latent|>")
     tokenizer.add_tokens("<|latent|>")
-    latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
-    start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
-    end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
+    latent_id: int = tokenizer.convert_tokens_to_ids("<|latent|>")
+    start_id: int = tokenizer.convert_tokens_to_ids("<|start-latent|>")
+    end_id: int = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
     loaded = False
 
     if configs.load_model_path != "None":
+        # TODO: add type hint
         saved_weights = torch.load(
             configs.load_model_path, map_location=torch.device(rank)
         )
@@ -130,6 +144,7 @@ def main():
         ):
             raise ValueError("Cannot load coconut model weights into a causallm model")
 
+        # TODO: the use case of this if statement is not clear
         elif configs.coconut and any(
             [k.startswith("base_causallm") for k in saved_weights.keys()]
         ):
@@ -142,6 +157,7 @@ def main():
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
 
+    # TODO: the use case of this if statement is not clear
     if not (configs.cot or configs.no_thoughts or configs.no_cot):
         # if we need new tokens, initialize their embeddings and lm heads
         model.resize_token_embeddings(len(tokenizer))
@@ -150,7 +166,7 @@ def main():
         # initialize the new token embeddings with a known token
         # it helps stablize the training
         for token_id in [latent_id, start_id, end_id]:
-            target_embedding = embeddings.weight.data[token_id]
+            target_embedding = embeddings.weight.data[target_id]
             embeddings.weight.data[token_id] = target_embedding
             # The input embeddings and lm heads are tied in GPT2. So the code below is not necessary
             lm_head = model.lm_head
@@ -195,11 +211,12 @@ def main():
         print(parallel_model)
 
     # prepare the ground truth answer and cot for evaluation
-    question_val = [d["question"] for d in json.load(open(configs.val_path))]
-    answers_val = [
+    question_val: list[str] = [d["question"] for d in json.load(open(configs.val_path))]
+    # for example: "answer": "2,125" -> "2125"
+    answers_val: list[str] = [
         d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))
     ]
-    cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
+    cot_val: list[str] = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
 
     base_dataset_valid = get_dataset(
         configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000
@@ -241,8 +258,9 @@ def main():
 
     for epoch in range(configs.resume, configs.num_epochs):
 
+        # TODO: the use case of this statement is not clear
         scheduled_stage = (
-            0 if (configs.cot or configs.no_cot) else epoch // configs.epochs_per_stage
+            0 if (configs.cot or configs.no_cot) else (epoch // configs.epochs_per_stage)
         )
         dataset_gen_val = get_question_latent_dataset(
             scheduled_stage,
@@ -251,6 +269,9 @@ def main():
             start_id,
             latent_id,
             end_id,
+            # TODO: the use case of this statement is not clear
+            # if configs.cot or configs.no_cot or configs.no_thoughts == True,
+            # the function still uses `latent_id`
             no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts,
         )
 
@@ -328,6 +349,7 @@ def main():
                 dynamic_ncols=True,
             )
 
+            batch: TrainDataLoaderDict
             for step, batch in enumerate(train_dataloader):
 
                 if step == 0 and wandb_run and rank == 0:

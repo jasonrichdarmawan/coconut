@@ -12,11 +12,48 @@ import torch.distributed as dist
 from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
+from typing import TypedDict
+from utils import Config
 
+class SampleDict(TypedDict):
+    question: str
+    steps: list[str]
+    answer: str
 
-def get_dataset(path, tokenizer, max_size=1000000000):
+class SampleIdxDict(TypedDict):
+    question: str
+    steps: list[str]
+    answer: str
+    idx: int
 
-    def tokenize_sample(sample):
+class SampleTokenizedDict(TypedDict):
+    question_tokenized: list[int]
+    steps_tokenized: list[list[int]]
+    answer_tokenized: list[int]
+    idx: int
+
+class SampleQuestionLatentDict(TypedDict):
+    """
+    input_ids: list[int] consists of [question_tokenized] + [start_id] + [latent_id] * k + [end_id]
+    """
+    input_ids: list[int]
+    idx: int
+    attention_mask: list[int]
+    position_ids: list[int]
+
+class SampleCotLatentDict(TypedDict):
+    """
+    input_ids: list[int] consists of [question_tokenized] + [start_id] + [latent_id] * k + [end_id] + [steps_tokenized] + [answer_tokenized]
+    """
+    input_ids: list[int]
+    labels: list[int]
+    attention_mask: list[int]
+    idx: int
+    position_ids: list[int]
+
+def get_dataset(path: str, tokenizer: PreTrainedTokenizerBase, max_size=1000000000):
+
+    def tokenize_sample(sample: SampleDict) -> SampleTokenizedDict:
 
         question_tokenized = tokenizer.encode(
             sample["question"] + "\n", add_special_tokens=True
@@ -29,7 +66,7 @@ def get_dataset(path, tokenizer, max_size=1000000000):
             "### " + sample["answer"], add_special_tokens=False
         ) + [tokenizer.eos_token_id]
 
-        sample = {
+        sample: SampleTokenizedDict = {
             "question_tokenized": question_tokenized,
             "steps_tokenized": steps_tokenized,
             "answer_tokenized": answer_tokenized,
@@ -37,8 +74,8 @@ def get_dataset(path, tokenizer, max_size=1000000000):
         }
         return sample
 
-    data = json.load(open(path))[:max_size]
-    data = [{**d, "idx": idx} for idx, d in enumerate(data)]
+    data: list[SampleDict] = json.load(open(path))[:max_size]
+    data: list[SampleIdxDict] = [{**d, "idx": idx} for idx, d in enumerate(data)]
 
     keys = data[0].keys()
     dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
@@ -48,7 +85,7 @@ def get_dataset(path, tokenizer, max_size=1000000000):
             processed_dataset = [
                 dataset.map(
                     tokenize_sample, remove_columns=list(dataset.features), num_proc=32
-                )
+                )   
             ]
         else:
             processed_dataset = [None]
@@ -83,7 +120,7 @@ class MyCollator:
     latent_id: Optional[int] = None
     label_pad_token_id: Optional[int] = -100
 
-    def __call__(self, features, return_tensors=None):
+    def __call__(self, features: list[SampleCotLatentDict], return_tensors=None):
 
         assert self.tokenizer.padding_side == "right"
 
@@ -108,6 +145,8 @@ class MyCollator:
         if len(earliest_latent) > 0:  # if there are continuous thoughts in the sequence
             latest_earliest_latent = max(earliest_latent)
             for feature in features:
+                # TODO: the use case of this statement is not clear
+                # why do we need too pad the input_ids based on the n_tok_pad?
                 if self.latent_id in feature["input_ids"]:
                     n_tok_pad = latest_earliest_latent - feature["input_ids"].index(
                         self.latent_id
@@ -120,6 +159,8 @@ class MyCollator:
                 feature["input_ids"] = [
                     self.tokenizer.pad_token_id
                 ] * n_tok_pad + feature["input_ids"]
+                # TODO: the use case of this statement is not clear
+                # what is the purpose of "labels" in feature?
                 if "labels" in feature:
                     feature["labels"] = [self.label_pad_token_id] * n_tok_pad + feature[
                         "labels"
@@ -153,6 +194,7 @@ class MyCollator:
             if label_name in features[0].keys()
             else None
         )
+        # TODO: the use case of this statement is not clear
         if labels is not None and all(label is None for label in labels):
             labels = None
         position_ids = (
@@ -171,6 +213,9 @@ class MyCollator:
             ]
             batch["labels"] = torch.tensor(batch["labels"], dtype=torch.int64)
 
+        # TODO: use case of this statement is not clear
+        # why do we pad on the right side?
+        # the feature["position_ids"] is already padded on the left side
         if position_ids is not None:
             max_pos_length = max(len(l) for l in position_ids)
 
@@ -186,16 +231,16 @@ class MyCollator:
 
 
 def get_question_latent_dataset(
-    scheduled_stage,
-    base_dataset_valid,
-    configs,
-    start_id,
-    latent_id,
-    end_id,
+    scheduled_stage: int,
+    base_dataset_valid: Dataset | None,
+    configs: Config,
+    start_id: int,
+    latent_id: int,
+    end_id: int,
     no_special_marker=False,
 ):
 
-    def process_dataset(sample):
+    def process_dataset(sample: SampleTokenizedDict):
 
         if configs.pad_latent_to_max:
             max_latent_stage = configs.max_latent_stage
@@ -208,6 +253,7 @@ def get_question_latent_dataset(
 
         k *= configs.c_thought
 
+        # TODO: this is interesting
         tokens = (
             sample["question_tokenized"]
             + ([] if no_special_marker else [start_id])
@@ -228,19 +274,19 @@ def get_question_latent_dataset(
 
 
 def get_cot_latent_dataset(
-    scheduled_stage,
-    base_dataset,
-    configs,
-    start_id,
-    latent_id,
-    end_id,
+    scheduled_stage: int,
+    base_dataset: Dataset,
+    configs: Config,
+    start_id: int,
+    latent_id: int,
+    end_id: int,
     no_special_marker=False,
     shuffle=False,
 ):
 
     n_additional_tokens = 0 if no_special_marker else 2
 
-    def process_dataset(sample):
+    def process_dataset(sample: SampleTokenizedDict) -> SampleCotLatentDict:
 
         if (
             random.random() < configs.uniform_prob
@@ -251,6 +297,7 @@ def get_cot_latent_dataset(
         else:
             scheduled_stage_to_train = scheduled_stage
 
+        # TODO: use case of this statement is not clear
         if scheduled_stage_to_train > configs.max_latent_stage:
             n_skip_steps = 10000  # skip all
             if configs.pad_latent_to_max:
@@ -261,6 +308,7 @@ def get_cot_latent_dataset(
                 )
 
         else:
+            # TODO: use case of this statement is not clear
             n_skip_steps, n_latent_tokens = (
                 scheduled_stage_to_train,
                 scheduled_stage_to_train,
@@ -270,8 +318,13 @@ def get_cot_latent_dataset(
             n_skip_steps = 100  # skip all step
             n_latent_tokens = 0
 
+        # TODO: use case of this statement is not clear
+        # assuming n_latent_tokens is k * c (term used in the paper)
+        # why k either:
+        # 1. random(len(sample["steps_tokenized"]) + 1)
+        # 2. configs.max_latent_stage
+        # 3. min(len(sample["steps_tokenized"]), configs.max_latent_stage)
         n_latent_tokens *= configs.c_thought
-
         tokens = (
             sample["question_tokenized"]
             + ([] if no_special_marker else [start_id])
@@ -285,6 +338,8 @@ def get_cot_latent_dataset(
 
         return {
             "input_ids": tokens,
+            # TODO: this is interesting
+            # why do we need to label [Question] [Latent] with [-100]?
             "labels": [-100]
             * (
                 len(sample["question_tokenized"])

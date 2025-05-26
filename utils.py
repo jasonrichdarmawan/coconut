@@ -4,11 +4,41 @@
 import random, torch, os
 import numpy as np
 
+from typing import TypedDict, Optional
 
 class Config:
-    # to access a dict with object.key
-    def __init__(self, dictionary):
-        self.__dict__ = dictionary
+    project: str
+    save_path: str
+    name: str
+
+    only_eval: bool
+
+    coconut: bool
+    cot: bool
+    no_thoughts: bool
+    no_cot: bool
+
+    c_thought: int
+    epochs_per_stage: int
+    max_latent_stage: int
+    pad_latent_to_max: bool
+
+    save_only_improve: bool
+    uniform_prob: float
+    model_id: str
+    load_model_path: Optional[str]
+    seed: int
+    resume: int
+    bf16: bool
+    train_path: str
+    val_path: str
+    reset_optimizer: bool
+    batch_size_training: int
+    debug: bool
+    gradient_accumulation_steps: int
+    num_epochs: int
+    lr: float
+    weight_decay: float
 
 
 def set_seed(seed_value):
